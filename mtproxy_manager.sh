@@ -30,12 +30,11 @@ LOG_DIR="/var/log/mtproxy"
 PID_DIR="/var/run/mtproxy"
 
 # ============================================================
-# СОЗДАНИЕ ДИРЕКТОРИЙ
+# ФУНКЦИЯ: СОЗДАНИЕ ВСЕХ ДИРЕКТОРИЙ
 # ============================================================
 create_dirs() {
-    mkdir -p "${LOG_DIR}"
-    mkdir -p "${PID_DIR}"
-    touch "${CONFIG_FILE}"
+    mkdir -p "${LOG_DIR}" "${PID_DIR}"
+    touch "${CONFIG_FILE}" 2>/dev/null || true
     echo -e "${GREEN}✓ Директории созданы:${NC}"
     echo -e "  Логи: ${LOG_DIR}"
     echo -e "  PID:  ${PID_DIR}"
@@ -43,17 +42,14 @@ create_dirs() {
 }
 
 # ============================================================
-# УСТАНОВКА MTBUDDY
+# ФУНКЦИЯ: УСТАНОВКА MTBUDDY (ЕСЛИ НЕТ)
 # ============================================================
 install_mtbuddy() {
     if [[ -f "${MTBUDDY_BIN}" ]]; then
         echo -e "${GREEN}✓ mtbuddy уже установлен.${NC}"
         return
     fi
-    
-    echo -e "${YELLOW}Установка mtbuddy (5-10 минут)...${NC}"
-    
-    # Зависимости
+    echo -e "${YELLOW}Установка mtbuddy (займёт 5–10 минут)...${NC}"
     apt-get update -qq
     apt-get install -y -qq curl git build-essential xz-utils net-tools dnsutils
     
@@ -76,24 +72,24 @@ install_mtbuddy() {
     zig build -Drelease-safe
     cp zig-out/bin/mtbuddy "${MTBUDDY_BIN}"
     chmod +x "${MTBUDDY_BIN}"
-    
     echo -e "${GREEN}✓ mtbuddy установлен.${NC}"
 }
 
 # ============================================================
-# ГЕНЕРАЦИЯ СЕКРЕТА
+# ФУНКЦИЯ: ГЕНЕРАЦИЯ СЕКРЕТА
 # ============================================================
 generate_secret() {
     head -c 16 /dev/urandom | xxd -ps
 }
 
 # ============================================================
-# ПРОВЕРКА, РАБОТАЕТ ЛИ ПРОКСИ
+# ФУНКЦИЯ: ПРОВЕРКА, РАБОТАЕТ ЛИ ПРОКСИ
 # ============================================================
 is_running() {
     local port="$1"
-    if [[ -f "${PID_DIR}/proxy_${port}.pid" ]]; then
-        local pid=$(cat "${PID_DIR}/proxy_${port}.pid")
+    local pid_file="${PID_DIR}/proxy_${port}.pid"
+    if [[ -f "$pid_file" ]]; then
+        local pid=$(cat "$pid_file")
         if kill -0 "$pid" 2>/dev/null; then
             return 0
         fi
@@ -102,7 +98,7 @@ is_running() {
 }
 
 # ============================================================
-# ЗАПУСК ПРОКСИ
+# ФУНКЦИЯ: ЗАПУСК ПРОКСИ
 # ============================================================
 start_proxy() {
     local port="$1"
@@ -111,16 +107,16 @@ start_proxy() {
     local log_file="${LOG_DIR}/proxy_${port}.log"
     local pid_file="${PID_DIR}/proxy_${port}.pid"
     
-    # Создаём директории на всякий случай
+    # Создаём директории (на всякий случай)
     mkdir -p "${LOG_DIR}" "${PID_DIR}"
     
-    # Останавливаем старый, если есть
+    # Останавливаем старый процесс, если есть
     if is_running "$port"; then
         kill $(cat "$pid_file") 2>/dev/null
         rm -f "$pid_file"
     fi
     
-    # Запускаем в фоне с перезапуском
+    # Запускаем в фоне с бесконечным перезапуском
     (
         while true; do
             ${MTBUDDY_BIN} install --port "$port" --domain "$domain" --secret "$secret"
@@ -148,7 +144,7 @@ start_proxy() {
 }
 
 # ============================================================
-# СОЗДАНИЕ ПРОКСИ
+# ФУНКЦИЯ: СОЗДАНИЕ ПРОКСИ
 # ============================================================
 create_proxy() {
     clear
@@ -161,7 +157,18 @@ create_proxy() {
         return
     fi
     
-    read -p "Домен (например, example.com): " domain
+    read -p "Домен (оставьте пустым для использования IP-адреса сервера): " domain
+    if [[ -z "$domain" ]]; then
+        # Получаем IP-адрес сервера автоматически
+        domain=$(curl -s ifconfig.me || dig +short myip.opendns.com @resolver1.opendns.com || hostname -I | awk '{print $1}')
+        if [[ -z "$domain" ]]; then
+            echo -e "${RED}Не удалось определить IP-адрес. Введите домен вручную.${NC}"
+            read -p "Домен: " domain
+        else
+            echo -e "${YELLOW}Используем IP-адрес сервера: ${domain}${NC}"
+        fi
+    fi
+    
     if [[ -z "$domain" ]]; then
         echo -e "${RED}Домен обязателен.${NC}"
         return
@@ -179,13 +186,17 @@ create_proxy() {
         return
     fi
     
-    # Проверяем домен
-    if dig +short "$domain" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-        echo -e "${GREEN}✓ Домен резолвится в IP.${NC}"
+    # Проверяем домен (если это не IP)
+    if [[ "$domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo -e "${GREEN}✓ Используется IP-адрес.${NC}"
     else
-        echo -e "${YELLOW}⚠ Домен не резолвится! Прокси может не работать.${NC}"
-        read -p "Продолжить? (y/N): " confirm
-        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
+        if dig +short "$domain" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo -e "${GREEN}✓ Домен резолвится в IP.${NC}"
+        else
+            echo -e "${YELLOW}⚠ Домен не резолвится! Прокси может не работать.${NC}"
+            read -p "Продолжить? (y/N): " confirm
+            [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
+        fi
     fi
     
     # Проверяем порт
@@ -210,12 +221,11 @@ create_proxy() {
         echo ""
         echo -e "${YELLOW}📋 Логи: tail -f ${LOG_DIR}/proxy_${port}.log${NC}"
         echo -e "${YELLOW}🛑 Остановка: kill \$(cat ${PID_DIR}/proxy_${port}.pid)${NC}"
-        echo -e "${YELLOW}🔄 Перезапуск: systemctl restart mtproxy-${port} 2>/dev/null || ${MTBUDDY_BIN} install --port ${port} --domain ${domain} --secret ${secret}${NC}"
     fi
 }
 
 # ============================================================
-# СПИСОК ПРОКСИ
+# ФУНКЦИЯ: СПИСОК ПРОКСИ
 # ============================================================
 list_proxies() {
     clear
@@ -246,7 +256,7 @@ list_proxies() {
 }
 
 # ============================================================
-# ЛОГИ
+# ФУНКЦИЯ: ЛОГИ
 # ============================================================
 show_logs() {
     list_proxies
@@ -273,7 +283,7 @@ show_logs() {
 }
 
 # ============================================================
-# УДАЛЕНИЕ
+# ФУНКЦИЯ: УДАЛЕНИЕ
 # ============================================================
 remove_proxy() {
     list_proxies
@@ -333,16 +343,16 @@ show_menu() {
 }
 
 # ============================================================
-# ЗАПУСК
+# ГЛАВНАЯ ЧАСТЬ (ВЫПОЛНЯЕТСЯ ПРИ ЗАПУСКЕ)
 # ============================================================
 
-# Создаём все необходимые директории
+# 1. Создаём все нужные папки и файлы
 create_dirs
 
-# Установка mtbuddy
+# 2. Устанавливаем mtbuddy, если его нет
 install_mtbuddy
 
-# Главное меню
+# 3. Бесконечное меню
 while true; do
     show_menu
 done
