@@ -30,7 +30,20 @@ LOG_DIR="/var/log/mtproxy"
 PID_DIR="/var/run/mtproxy"
 
 # ============================================================
-# УСТАНОВКА
+# СОЗДАНИЕ ДИРЕКТОРИЙ
+# ============================================================
+create_dirs() {
+    mkdir -p "${LOG_DIR}"
+    mkdir -p "${PID_DIR}"
+    touch "${CONFIG_FILE}"
+    echo -e "${GREEN}✓ Директории созданы:${NC}"
+    echo -e "  Логи: ${LOG_DIR}"
+    echo -e "  PID:  ${PID_DIR}"
+    echo -e "  Конфиг: ${CONFIG_FILE}"
+}
+
+# ============================================================
+# УСТАНОВКА MTBUDDY
 # ============================================================
 install_mtbuddy() {
     if [[ -f "${MTBUDDY_BIN}" ]]; then
@@ -42,7 +55,7 @@ install_mtbuddy() {
     
     # Зависимости
     apt-get update -qq
-    apt-get install -y -qq curl git build-essential xz-utils net-tools
+    apt-get install -y -qq curl git build-essential xz-utils net-tools dnsutils
     
     # Zig
     cd /tmp
@@ -54,13 +67,15 @@ install_mtbuddy() {
     # Сборка mtbuddy
     mkdir -p "${WORKDIR}"
     cd "${WORKDIR}"
-    git clone --depth 1 https://github.com/sleep3r/mtproto.zig.git
-    cd mtproto.zig
+    if [[ -d "mtproto.zig" ]]; then
+        cd mtproto.zig && git pull
+    else
+        git clone --depth 1 https://github.com/sleep3r/mtproto.zig.git
+        cd mtproto.zig
+    fi
     zig build -Drelease-safe
     cp zig-out/bin/mtbuddy "${MTBUDDY_BIN}"
     chmod +x "${MTBUDDY_BIN}"
-    
-    mkdir -p "${LOG_DIR}" "${PID_DIR}"
     
     echo -e "${GREEN}✓ mtbuddy установлен.${NC}"
 }
@@ -87,7 +102,7 @@ is_running() {
 }
 
 # ============================================================
-# ЗАПУСК ПРОКСИ (ГЛАВНАЯ ФУНКЦИЯ)
+# ЗАПУСК ПРОКСИ
 # ============================================================
 start_proxy() {
     local port="$1"
@@ -95,6 +110,9 @@ start_proxy() {
     local secret="$3"
     local log_file="${LOG_DIR}/proxy_${port}.log"
     local pid_file="${PID_DIR}/proxy_${port}.pid"
+    
+    # Создаём директории на всякий случай
+    mkdir -p "${LOG_DIR}" "${PID_DIR}"
     
     # Останавливаем старый, если есть
     if is_running "$port"; then
@@ -114,14 +132,17 @@ start_proxy() {
     local pid=$!
     echo "$pid" > "$pid_file"
     
-    sleep 2
+    sleep 3
     
     if is_running "$port"; then
         echo -e "${GREEN}✓ Прокси запущен (PID: $pid)${NC}"
         return 0
     else
         echo -e "${RED}✗ Не удалось запустить прокси${NC}"
-        tail -5 "$log_file"
+        if [[ -f "$log_file" ]]; then
+            echo -e "${YELLOW}Последние строки лога:${NC}"
+            tail -10 "$log_file"
+        fi
         return 1
     fi
 }
@@ -187,8 +208,9 @@ create_proxy() {
         echo -e "${CYAN}🌐 Альтернативная ссылка:${NC}"
         echo -e "https://t.me/proxy?server=${domain}&port=${port}&secret=${secret}"
         echo ""
-        echo -e "${YELLOW}Логи: tail -f ${LOG_DIR}/proxy_${port}.log${NC}"
-        echo -e "${YELLOW}Остановка: kill \$(cat ${PID_DIR}/proxy_${port}.pid)${NC}"
+        echo -e "${YELLOW}📋 Логи: tail -f ${LOG_DIR}/proxy_${port}.log${NC}"
+        echo -e "${YELLOW}🛑 Остановка: kill \$(cat ${PID_DIR}/proxy_${port}.pid)${NC}"
+        echo -e "${YELLOW}🔄 Перезапуск: systemctl restart mtproxy-${port} 2>/dev/null || ${MTBUDDY_BIN} install --port ${port} --domain ${domain} --secret ${secret}${NC}"
     fi
 }
 
@@ -246,7 +268,7 @@ show_logs() {
         echo -e "${CYAN}--- Логи порта ${port} (последние 30 строк) ---${NC}"
         tail -30 "$log_file"
     else
-        echo -e "${YELLOW}Лог-файл не найден.${NC}"
+        echo -e "${YELLOW}Лог-файл не найден: ${log_file}${NC}"
     fi
 }
 
@@ -314,11 +336,11 @@ show_menu() {
 # ЗАПУСК
 # ============================================================
 
-# Установка
-install_mtbuddy
+# Создаём все необходимые директории
+create_dirs
 
-# Создаём конфиг, если нет
-touch "${CONFIG_FILE}"
+# Установка mtbuddy
+install_mtbuddy
 
 # Главное меню
 while true; do
