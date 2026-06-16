@@ -1,8 +1,7 @@
 #!/bin/bash
-set -e
 
 # ============================================================
-#   ЦВЕТА
+# ЦВЕТА
 # ============================================================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -13,7 +12,7 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # ============================================================
-#   ПРОВЕРКА ROOT
+# ПРОВЕРКА ROOT
 # ============================================================
 if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}${BOLD}Ошибка:${NC} Запускайте с sudo."
@@ -21,180 +20,127 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # ============================================================
-#   ПЕРЕМЕННЫЕ
+# ПЕРЕМЕННЫЕ
 # ============================================================
 WORKDIR="/opt/mtproto"
 BIN_DIR="/usr/local/bin"
 CONFIG_FILE="/etc/mtproxy_instances.conf"
-SYSTEMD_DIR="/etc/systemd/system"
 MTBUDDY_BIN="${BIN_DIR}/mtbuddy"
-LOG_FILE="/var/log/mtproxy_manager.log"
-ZIG_VERSION="0.13.0"
-ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+LOG_DIR="/var/log/mtproxy"
+PID_DIR="/var/run/mtproxy"
 
 # ============================================================
-#   ЛОГГИРОВАНИЕ
+# УСТАНОВКА
 # ============================================================
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
-}
-
-# ============================================================
-#   УСТАНОВКА ЗАВИСИМОСТЕЙ
-# ============================================================
-install_deps() {
-    log "Установка зависимостей..."
-    apt-get update -qq
-    apt-get install -y -qq curl git build-essential xz-utils dnsutils net-tools
-    log "Зависимости установлены."
-}
-
-# ============================================================
-#   УСТАНОВКА ZIG
-# ============================================================
-install_zig() {
-    if command -v zig &>/dev/null; then
-        log "Zig уже установлен."
-        return
-    fi
-    log "Установка Zig ${ZIG_VERSION}..."
-    cd /tmp
-    curl -# -L -O "${ZIG_URL}"
-    tar -xf "zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
-    mv "zig-linux-x86_64-${ZIG_VERSION}" /opt/zig
-    ln -sf /opt/zig/zig /usr/local/bin/zig
-    log "Zig установлен."
-}
-
-# ============================================================
-#   СБОРКА MTBUDDY
-# ============================================================
-build_mtbuddy() {
+install_mtbuddy() {
     if [[ -f "${MTBUDDY_BIN}" ]]; then
-        log "mtbuddy уже собран."
+        echo -e "${GREEN}✓ mtbuddy уже установлен.${NC}"
         return
     fi
-    log "Сборка mtbuddy (3-5 минут)..."
+    
+    echo -e "${YELLOW}Установка mtbuddy (5-10 минут)...${NC}"
+    
+    # Зависимости
+    apt-get update -qq
+    apt-get install -y -qq curl git build-essential xz-utils net-tools
+    
+    # Zig
+    cd /tmp
+    curl -# -L -O "https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz"
+    tar -xf zig-linux-x86_64-0.13.0.tar.xz
+    mv zig-linux-x86_64-0.13.0 /opt/zig
+    ln -sf /opt/zig/zig /usr/local/bin/zig
+    
+    # Сборка mtbuddy
     mkdir -p "${WORKDIR}"
     cd "${WORKDIR}"
-    if [[ -d "mtproto.zig" ]]; then
-        cd mtproto.zig && git pull
-    else
-        git clone --depth 1 https://github.com/sleep3r/mtproto.zig.git
-        cd mtproto.zig
-    fi
+    git clone --depth 1 https://github.com/sleep3r/mtproto.zig.git
+    cd mtproto.zig
     zig build -Drelease-safe
     cp zig-out/bin/mtbuddy "${MTBUDDY_BIN}"
     chmod +x "${MTBUDDY_BIN}"
-    log "mtbuddy собран."
+    
+    mkdir -p "${LOG_DIR}" "${PID_DIR}"
+    
+    echo -e "${GREEN}✓ mtbuddy установлен.${NC}"
 }
 
 # ============================================================
-#   ГЕНЕРАЦИЯ СЕКРЕТА (HEX)
+# ГЕНЕРАЦИЯ СЕКРЕТА
 # ============================================================
 generate_secret() {
-    head -c 16 /dev/urandom | xxd -ps | tr -d '\n'
+    head -c 16 /dev/urandom | xxd -ps
 }
 
 # ============================================================
-#   ПРОВЕРКА, РАБОТАЕТ ЛИ ПРОКСИ
+# ПРОВЕРКА, РАБОТАЕТ ЛИ ПРОКСИ
 # ============================================================
-check_proxy() {
+is_running() {
     local port="$1"
-    local domain="$2"
-    local secret="$3"
-    
-    echo -e "${YELLOW}Проверка прокси на порту ${port}...${NC}"
-    
-    # Проверяем, слушает ли порт
-    if netstat -tlnp 2>/dev/null | grep -q ":${port}"; then
-        echo -e "${GREEN}✓ Порт ${port} слушает.${NC}"
-    else
-        echo -e "${RED}✗ Порт ${port} НЕ слушает.${NC}"
-        return 1
+    if [[ -f "${PID_DIR}/proxy_${port}.pid" ]]; then
+        local pid=$(cat "${PID_DIR}/proxy_${port}.pid")
+        if kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
     fi
-    
-    # Проверяем через mtbuddy (если есть такая команда)
-    if command -v curl &>/dev/null; then
-        echo -e "${YELLOW}Проверка соединения...${NC}"
-        curl -s -o /dev/null -w "HTTP %{http_code}\n" "http://${domain}:${port}/" 2>/dev/null || echo "Ошибка соединения"
-    fi
-    
-    return 0
+    return 1
 }
 
 # ============================================================
-#   СОЗДАНИЕ SYSTEMD СЕРВИСА (ИСПРАВЛЕННЫЙ)
+# ЗАПУСК ПРОКСИ (ГЛАВНАЯ ФУНКЦИЯ)
 # ============================================================
-create_systemd_service() {
+start_proxy() {
     local port="$1"
     local domain="$2"
     local secret="$3"
-    local service_name="mtproxy-${port}"
-    local service_file="${SYSTEMD_DIR}/${service_name}.service"
-
-    cat > "$service_file" <<EOF
-[Unit]
-Description=MTProto Proxy ${port}
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${MTBUDDY_BIN} install --port ${port} --domain ${domain} --secret ${secret}
-Restart=on-failure
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable "${service_name}"
-    systemctl start "${service_name}"
+    local log_file="${LOG_DIR}/proxy_${port}.log"
+    local pid_file="${PID_DIR}/proxy_${port}.pid"
+    
+    # Останавливаем старый, если есть
+    if is_running "$port"; then
+        kill $(cat "$pid_file") 2>/dev/null
+        rm -f "$pid_file"
+    fi
+    
+    # Запускаем в фоне с перезапуском
+    (
+        while true; do
+            ${MTBUDDY_BIN} install --port "$port" --domain "$domain" --secret "$secret"
+            echo "$(date): Прокси упал, перезапуск через 5 секунд..." >> "$log_file"
+            sleep 5
+        done
+    ) >> "$log_file" 2>&1 &
+    
+    local pid=$!
+    echo "$pid" > "$pid_file"
     
     sleep 2
     
-    if systemctl is-active --quiet "${service_name}"; then
-        log "Сервис ${service_name} запущен."
+    if is_running "$port"; then
+        echo -e "${GREEN}✓ Прокси запущен (PID: $pid)${NC}"
         return 0
     else
-        log "ОШИБКА: Сервис ${service_name} не запустился!"
-        journalctl -u "${service_name}" -n 20 --no-pager
+        echo -e "${RED}✗ Не удалось запустить прокси${NC}"
+        tail -5 "$log_file"
         return 1
     fi
 }
 
 # ============================================================
-#   ГЕНЕРАЦИЯ ССЫЛОК
-# ============================================================
-generate_links() {
-    local domain="$1"
-    local port="$2"
-    local secret="$3"
-    
-    # Секрет уже должен быть в hex
-    local link1="tg://proxy?server=${domain}&port=${port}&secret=${secret}"
-    local link2="https://t.me/proxy?server=${domain}&port=${port}&secret=${secret}"
-    
-    echo -e "${CYAN}📱 tg://:${NC} $link1"
-    echo -e "${CYAN}🌐 https:${NC} $link2"
-}
-
-# ============================================================
-#   СОЗДАНИЕ ПРОКСИ
+# СОЗДАНИЕ ПРОКСИ
 # ============================================================
 create_proxy() {
+    clear
     echo -e "${BLUE}${BOLD}--- Создание прокси ---${NC}"
+    echo ""
     
-    read -p "Порт (443, 8443 и т.д.): " port
+    read -p "Порт (например, 443): " port
     if [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]]; then
         echo -e "${RED}Неверный порт.${NC}"
         return
     fi
     
-    read -p "Домен (ваш.домен.com): " domain
+    read -p "Домен (например, example.com): " domain
     if [[ -z "$domain" ]]; then
         echo -e "${RED}Домен обязателен.${NC}"
         return
@@ -206,22 +152,17 @@ create_proxy() {
         echo -e "${YELLOW}Сгенерирован секрет: ${secret}${NC}"
     fi
     
-    # Проверяем, что секрет в hex
+    # Проверка секрета (должен быть hex)
     if [[ ! "$secret" =~ ^[0-9a-fA-F]+$ ]]; then
-        echo -e "${RED}Секрет должен быть в HEX (только 0-9, A-F).${NC}"
+        echo -e "${RED}Секрет должен быть в HEX (0-9, A-F).${NC}"
         return
-    fi
-    
-    # Проверка длины секрета (должен быть 32 символа для 16 байт)
-    if [[ ${#secret} -ne 32 ]]; then
-        echo -e "${YELLOW}Предупреждение: секрет длиной ${#secret} символов (обычно 32).${NC}"
     fi
     
     # Проверяем домен
     if dig +short "$domain" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-        echo -e "${GREEN}✓ Домен резолвится.${NC}"
+        echo -e "${GREEN}✓ Домен резолвится в IP.${NC}"
     else
-        echo -e "${RED}✗ Домен НЕ резолвится! Прокси не будет работать.${NC}"
+        echo -e "${YELLOW}⚠ Домен не резолвится! Прокси может не работать.${NC}"
         read -p "Продолжить? (y/N): " confirm
         [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
     fi
@@ -232,40 +173,42 @@ create_proxy() {
         return
     fi
     
-    # Создаём сервис
-    if create_systemd_service "$port" "$domain" "$secret"; then
+    # Запускаем
+    if start_proxy "$port" "$domain" "$secret"; then
+        # Сохраняем в конфиг
         echo "${port}:${domain}:${secret}" >> "${CONFIG_FILE}"
         
-        echo -e "\n${GREEN}${BOLD}✅ Прокси создан и работает!${NC}"
-        generate_links "$domain" "$port" "$secret"
-        
-        # Проверка
-        check_proxy "$port" "$domain" "$secret"
-        
-        log "Создан прокси: ${port} ${domain}"
-    else
-        echo -e "${RED}❌ Не удалось запустить прокси.${NC}"
-        echo -e "${YELLOW}Проверьте логи: journalctl -u mtproxy-${port} -n 50${NC}"
+        echo ""
+        echo -e "${GREEN}${BOLD}✅ Прокси создан и работает!${NC}"
+        echo ""
+        echo -e "${CYAN}📱 Ссылка для Telegram:${NC}"
+        echo -e "tg://proxy?server=${domain}&port=${port}&secret=${secret}"
+        echo ""
+        echo -e "${CYAN}🌐 Альтернативная ссылка:${NC}"
+        echo -e "https://t.me/proxy?server=${domain}&port=${port}&secret=${secret}"
+        echo ""
+        echo -e "${YELLOW}Логи: tail -f ${LOG_DIR}/proxy_${port}.log${NC}"
+        echo -e "${YELLOW}Остановка: kill \$(cat ${PID_DIR}/proxy_${port}.pid)${NC}"
     fi
 }
 
 # ============================================================
-#   СПИСОК ПРОКСИ
+# СПИСОК ПРОКСИ
 # ============================================================
 list_proxies() {
+    clear
     echo -e "${BLUE}${BOLD}--- Список прокси ---${NC}"
+    echo ""
     
     if [[ ! -f "${CONFIG_FILE}" ]] || [[ ! -s "${CONFIG_FILE}" ]]; then
-        echo -e "${YELLOW}Нет прокси.${NC}"
+        echo -e "${YELLOW}Нет созданных прокси.${NC}"
         return
     fi
     
     local i=1
     while IFS=: read -r port domain secret; do
-        local service="mtproxy-${port}"
         local status
-        
-        if systemctl is-active --quiet "${service}" 2>/dev/null; then
+        if is_running "$port"; then
             status="${GREEN}✅ Работает${NC}"
         else
             status="${RED}❌ Остановлен${NC}"
@@ -274,21 +217,14 @@ list_proxies() {
         echo -e "${GREEN}[$i]${NC} Порт: ${BOLD}${port}${NC} | ${domain}"
         echo -e "    Секрет: ${secret}"
         echo -e "    Статус: ${status}"
-        
-        if netstat -tlnp 2>/dev/null | grep -q ":${port}"; then
-            echo -e "    ${GREEN}Порт слушает${NC}"
-        else
-            echo -e "    ${RED}Порт НЕ слушает${NC}"
-        fi
-        
-        generate_links "$domain" "$port" "$secret" | sed 's/^/    /'
+        echo -e "    Ссылка: tg://proxy?server=${domain}&port=${port}&secret=${secret}"
         echo ""
         ((i++))
     done < "${CONFIG_FILE}"
 }
 
 # ============================================================
-#   ЛОГИ
+# ЛОГИ
 # ============================================================
 show_logs() {
     list_proxies
@@ -296,7 +232,7 @@ show_logs() {
         return
     fi
     
-    read -p "Номер прокси для логов: " num
+    read -p "Введите номер прокси: " num
     local line=$(sed -n "${num}p" "${CONFIG_FILE}")
     if [[ -z "$line" ]]; then
         echo -e "${RED}Неверный номер.${NC}"
@@ -304,12 +240,18 @@ show_logs() {
     fi
     
     local port=$(echo "$line" | cut -d: -f1)
-    echo -e "${CYAN}--- Логи порта ${port} ---${NC}"
-    journalctl -u "mtproxy-${port}" -n 50 --no-pager
+    local log_file="${LOG_DIR}/proxy_${port}.log"
+    
+    if [[ -f "$log_file" ]]; then
+        echo -e "${CYAN}--- Логи порта ${port} (последние 30 строк) ---${NC}"
+        tail -30 "$log_file"
+    else
+        echo -e "${YELLOW}Лог-файл не найден.${NC}"
+    fi
 }
 
 # ============================================================
-#   УДАЛЕНИЕ
+# УДАЛЕНИЕ
 # ============================================================
 remove_proxy() {
     list_proxies
@@ -317,7 +259,7 @@ remove_proxy() {
         return
     fi
     
-    read -p "Номер прокси для удаления: " num
+    read -p "Введите номер прокси для удаления: " num
     local line=$(sed -n "${num}p" "${CONFIG_FILE}")
     if [[ -z "$line" ]]; then
         echo -e "${RED}Неверный номер.${NC}"
@@ -325,21 +267,24 @@ remove_proxy() {
     fi
     
     local port=$(echo "$line" | cut -d: -f1)
-    local service="mtproxy-${port}"
+    local pid_file="${PID_DIR}/proxy_${port}.pid"
+    local log_file="${LOG_DIR}/proxy_${port}.log"
     
-    echo -e "${YELLOW}Удаление ${service}...${NC}"
-    systemctl stop "${service}" 2>/dev/null || true
-    systemctl disable "${service}" 2>/dev/null || true
-    rm -f "${SYSTEMD_DIR}/${service}.service"
-    systemctl daemon-reload
+    echo -e "${YELLOW}Остановка прокси на порту ${port}...${NC}"
+    
+    if [[ -f "$pid_file" ]]; then
+        kill $(cat "$pid_file") 2>/dev/null
+        rm -f "$pid_file"
+    fi
+    
+    rm -f "$log_file"
     sed -i "${num}d" "${CONFIG_FILE}"
     
-    echo -e "${GREEN}✅ Прокси удалён.${NC}"
-    log "Удалён прокси ${port}"
+    echo -e "${GREEN}✓ Прокси удалён.${NC}"
 }
 
 # ============================================================
-#   МЕНЮ
+# МЕНЮ
 # ============================================================
 show_menu() {
     clear
@@ -366,27 +311,16 @@ show_menu() {
 }
 
 # ============================================================
-#   УСТАНОВКА
+# ЗАПУСК
 # ============================================================
-initial_setup() {
-    log "Первичная установка..."
-    install_deps
-    install_zig
-    build_mtbuddy
-    touch "${CONFIG_FILE}"
-    log "Установка завершена."
-}
 
-# ============================================================
-#   ЗАПУСК
-# ============================================================
-if [[ ! -f "${MTBUDDY_BIN}" ]]; then
-    echo -e "${YELLOW}Первичная установка (5-10 минут)...${NC}"
-    initial_setup
-else
-    log "Используем существующий mtbuddy."
-fi
+# Установка
+install_mtbuddy
 
+# Создаём конфиг, если нет
+touch "${CONFIG_FILE}"
+
+# Главное меню
 while true; do
     show_menu
 done
